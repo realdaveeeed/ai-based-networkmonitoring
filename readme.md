@@ -16,16 +16,16 @@ The core tools used in the project are Splunk Enterprise 10.2.2 (on-premise tria
 ### VMs
 Splunk Enterprise was installed on the server VM following the official documentation. A dedicated splunk system user was created and given ownership of /opt/splunk, and the service was configured to start on boot. Ports `8000 (web UI)` and `9997 (forwarder input)` were opened in UFW.
 
-The Splunk Universal Forwarder was installed on Target-Ubuntu. After installation it was pointed at the Splunk server on the port `9997` and configured to monitor /var/log, which covers auth logs, syslog, and other system events. To verify the connection, a quick search in Splunk for `index="main" host="targetserver"` confirms events are coming through.
+The Splunk Universal Forwarder was installed on Target-Ubuntu. After installation it was pointed at the Splunk server on the port `9997` and configured to monitor /var/log, which covers auth logs, syslog, and other system events. To verify the connection, a quick search in Splunk for `index="live" sourcetype="syslog"` confirms events are coming through.
 
-![alt text](image1.png)
+![alt text](image2.png)
 *This is after the Hydro attack*
 ### Getting Live data and importing the CICIDS2017 Dataset
 
 The `CICIDS2017` dataset is a publicly available collection of labeled network traffic from the Canadian Institute for Cybersecurity. It gives us realistic attack traffic to work with without having to generate everything ourselves.
 
 Three days of data were imported: `Monday` (clean baseline traffic), `Tuesday` (contains brute force attempts) and `Wednesday` (contains DoS variants). Each CSV was loaded into Splunk via `Add Data → Upload` and put into a dedicated cicids index with sourcetype csv. The important thing is to keep the Label column intact — it tells us what each flow actually is (Benign, DoS Slowloris, SSH-Patator, etc.) which we'll use later to check how well our model is doing. This is 2 million events worth of logs.
-![alt text](image.png)
+![alt text](image2.png)
 
 Live data comes from the target VM. `/vat/log/auth.log` is forwarded via `Splunk Forwarder` for the SSH brute force detection, and a dedicated `network_metrics` script pulling interface stats from `/proc/net/dev` for network anomaly detection
 
