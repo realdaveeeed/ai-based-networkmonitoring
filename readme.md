@@ -67,4 +67,11 @@ index="live" host="targetserver" sourcetype="network_metrics"
 | timechart span=1m max(bytes_per_30s) as max_network_load
 | fit DensityFunction max_network_load into live_network_model
 ```
-*Validation against the CICIDS2017 dataset is in progress.*
+### CICIDS2017 model — flow-based anomaly detection
+Trained on Monday's 500k benign network flows from the CICIDS2017 dataset. The feature used is `Flow Duration` — attack flows like DoS floods and brute force attempts tend to have characteristically different durations compared to normal web traffic, making it a useful signal for anomaly detection. Due to a multi-field limitation in the MLTK version used, the model was trained on this single feature. MLTK automatically sampled 100k events from the full 500k baseline for training, which is sufficient for DensityFunction to learn the distribution reliably.
+```spl
+index=cicids Label=BENIGN
+| rename "Flow Duration" as flow_duration
+| fit DensityFunction flow_duration threshold=0.01 into cicids_baseline_model
+```
+*Validation against Tuesday and Wednesday attack traffic is in progress.*
