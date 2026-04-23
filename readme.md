@@ -20,9 +20,9 @@ The `Splunk Universal Forwarder` was installed on the target VM, pointed at the 
 
 ### CICIDS2017 Dataset and Live Data
 
-The `CICIDS2017` dataset is a publicly available collection of labeled network traffic from the Canadian Institute for Cybersecurity. It gives us realistic attack traffic to work with without having to generate everything ourselves.
+The `CICIDS2017` dataset is a publicly available collection of labeled network flow data from the Canadian Institute for Cybersecurity. It gives us realistic attack traffic to work with without having to generate everything ourselves.
 
-Three days of data were imported: `Monday` (clean baseline traffic), `Tuesday` (contains brute force attempts) and `Wednesday` (contains DoS variants). Each CSV was loaded into Splunk via `Add Data → Upload` and put into a dedicated cicids index with sourcetype csv. The important thing is to keep the Label column intact — it tells us what each flow actually is (Benign, DoS Slowloris, SSH-Patator, etc.) which we'll use later to check how well our model is doing. This is 2 million events worth of logs.
+Three days of data were imported: `Monday` (clean baseline traffic), `Tuesday` (contains brute force attempts) and `Wednesday` (contains DoS variants). Each CSV was loaded into Splunk via `Add Data → Upload` and put into a dedicated cicids index with sourcetype csv. The important thing is to keep the Label column intact — it tells us what each flow actually is (Benign, DoS Slowloris, SSH-Patator, etc.) which we'll use later to check how well our model is doing. This is roughly 2 million events worth of logs.
 
 Two data streams come from the target VM into the live index. The first is `/var/log/auth.log` forwarded via the Universal Forwarder as `sourcetype="syslog"` which captures SSH authentication events. The second is a custom `network_metrics` script that reads raw interface stats from `/proc/net/dev` every 30 seconds and forwards them as a dedicated sourcetype. To verify both are coming through, searching `index="live" sourcetype="syslog"` in Splunk should show live events.
 ![alt text](image2.png)
@@ -30,7 +30,7 @@ Two data streams come from the target VM into the live index. The first is `/var
 ### Attacks 
 Two attacks were run from the Kali machine against the target to generate real event data. 
 
-**SSH brute force (Hydra)**: Hammers the target with SSH login attempts using the rockyou wordlist. Each failed attempt shows up in `auth.log` as a Failed password event. With 16 parallel threads this generates enough volume per minute for the model to clearly flag as anomalous.
+**SSH brute force (Hydra)**: Hydra Hammers the target with SSH login attempts using the rockyou wordlist. Each failed attempt shows up in `auth.log` as a Failed password event. With 16 parallel threads this generates enough volume per minute for the model to clearly flag as anomalous.
 
 ```bash
 hydra -l root -P /usr/share/wordlists/rockyou.txt ssh://192.168.0.47 -t 16 -V
@@ -68,10 +68,43 @@ index="live" host="targetserver" sourcetype="network_metrics"
 | fit DensityFunction max_network_load into live_network_model
 ```
 ### CICIDS2017 model — flow-based anomaly detection
-Trained on Monday's 500k benign network flows from the CICIDS2017 dataset. The feature used is `Flow Duration` — attack flows like DoS floods and brute force attempts tend to have characteristically different durations compared to normal web traffic, making it a useful signal for anomaly detection. Due to a multi-field limitation in the MLTK version used, the model was trained on this single feature. MLTK automatically sampled 100k events from the full 500k baseline for training, which is sufficient for DensityFunction to learn the distribution reliably.
+The model was trained on Monday's 500k benign flows from the CICIDS2017 dataset. Two approaches were tested.
+
+#### **First attempt — DensityFunction**
+
+The first attempt used the DensityFunction algorithm with Flow Duration as the feature. The reasoning was that brute force attacks tend to produce different connection lengths compared to normal traffic. However, two fundamental problems emerged:
+
+- DensityFunction is univariate, it can only handle one feature at a time
+- FTP-Patator and SSH-Patator flow duration values are very similar to normal traffic, so the model couldn't distinguish them.
+
+**Result:**
+![alt text](DensityFunction_detection_test.png)
+*0% detection rate on 13835 attack flows.*
+
+#### **Second attempt — OneClassSVM**
+
+Due to the DensityFunction limitation we switched to OneClassSVM which natively supports multiple features at once. Six features were used that are characteristic of brute force attacks: packet count, packet rate, flow duration, backward traffic metrics, and average packet size. Infinity values in the dataset — caused by zero-division errors in flow calculations — were filtered out before training.
 ```spl
-index=cicids Label=BENIGN
-| rename "Flow Duration" as flow_duration
-| fit DensityFunction flow_duration threshold=0.01 into cicids_baseline_model
+index=cicids Label=BENIGN earliest=0
+| rename "Total Fwd Packets" as total_fwd_packets, "Flow Packets_s" as flow_packets_s, "Flow Duration" as flow_duration, "Bwd Packets_s" as bwd_packets_s, "Total Backward Packets" as total_bwd_packets, "Fwd Packet Length Mean" as fwd_pkt_len_mean
+| where isnum(total_fwd_packets) AND isnum(flow_packets_s) AND isnum(flow_duration) AND isnum(bwd_packets_s) AND isnum(total_bwd_packets) AND isnum(fwd_pkt_len_mean)
+| where total_fwd_packets < 1e15 AND flow_packets_s < 1e15 AND flow_duration < 1e15
+| fit OneClassSVM total_fwd_packets flow_packets_s flow_duration bwd_packets_s total_bwd_packets fwd_pkt_len_mean into cicids_svm_model
 ```
-*Validation against Tuesday and Wednesday attack traffic is in progress.*
+**Validation**
+
+The model was validated against Tuesday attack traffic using the CICIDS2017 Label field as ground truth.
+```spl
+index=cicids Label!=BENIGN earliest=0
+| rename "Total Fwd Packets" as total_fwd_packets, "Flow Packets_s" as flow_packets_s, "Flow Duration" as flow_duration, "Bwd Packets_s" as bwd_packets_s, "Total Backward Packets" as total_bwd_packets, "Fwd Packet Length Mean" as fwd_pkt_len_mean
+| where isnum(total_fwd_packets) AND isnum(flow_packets_s) AND isnum(flow_duration) AND isnum(bwd_packets_s) AND isnum(total_bwd_packets) AND isnum(fwd_pkt_len_mean)
+| where total_fwd_packets < 1e15 AND flow_packets_s < 1e15 AND flow_duration < 1e15
+| apply cicids_svm_model as outlier_result
+| eval true_positive=if(outlier_result="-1", 1, 0)
+| stats sum(true_positive) as detected, count as total_attacks
+| eval detection_rate=round((detected/total_attacks)*100, 2)
+| table detected, total_attacks, detection_rate
+```
+**Result:**
+![alt text](OneClassSVM_detection_test.png)
+*89.91% detection rate — 12437 out of 13832 attack flows detected*
